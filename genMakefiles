@@ -12,7 +12,54 @@ fi
 
 platform=$1
 subdirs="liveMedia groupsock UsageEnvironment BasicUsageEnvironment testProgs mediaServer proxyServer hlsProxy"
-    
+
+# Use the specified platform config file
+config_file="config.$platform"
+if [ ! -f "$config_file" ]; then
+    echo "Error: $config_file not found" 1>&2
+    exit 1
+fi
+
+# Detect whether std::atomic_flag::test() is available with this toolchain/default standard
+need_no_std_lib=0
+cxx=$(sed -n 's/^CPLUSPLUS_COMPILER[[:space:]]*=[[:space:]]*//p' "$config_file" | head -n1)
+[ -z "$cxx" ] && cxx=c++
+
+: "${TMPDIR:=/tmp}"
+tmp_src="$(mktemp "$TMPDIR/live555_atomic_flag_test_XXXXXX.cpp")" || exit 1
+trap 'rm -f "$tmp_src"' EXIT INT HUP TERM
+cat > "$tmp_src" <<'EOF'
+#include <atomic>
+int main() {
+    std::atomic_flag f = ATOMIC_FLAG_INIT;
+    (void)f.test();
+    return 0;
+}
+EOF
+
+"$cxx" -c "$tmp_src" -o /dev/null >/dev/null 2>&1 || need_no_std_lib=1
+
+# Generate Makefiles
+for subdir in $subdirs
+do
+    /bin/rm -f "$subdir/Makefile"
+    cat "$subdir/Makefile.head" "$config_file" "$subdir/Makefile.tail" > "$subdir/Makefile"
+    if [ $need_no_std_lib -ne 0 ]; then
+        sed -i.bak 's/^\(CPLUSPLUS_FLAGS[[:space:]]*=[[:space:]]*.*\)$/\1 -DNO_STD_LIB/' "$subdir/Makefile" && rm -f "$subdir/Makefile.bak"
+    fi
+    chmod a-w "$subdir/Makefile"
+done
+
+/bin/rm -f Makefile
+cat Makefile.head "$config_file" Makefile.tail > Makefile
+if [ $need_no_std_lib -ne 0 ]; then
+    sed -i.bak 's/^\(CPLUSPLUS_FLAGS[[:space:]]*=[[:space:]]*.*\)$/\1 -DNO_STD_LIB/' Makefile && rm -f Makefile.bak
+fi
+chmod a-w Makefile
+
+exit 0
+
+
 for subdir in $subdirs
 do
     /bin/rm -f $subdir/Makefile
