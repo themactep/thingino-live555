@@ -148,6 +148,12 @@ private:
 //                                _atom(frma);
                                   _atom(esds);
                                   _atom(srcq);
+                          // Opus in ISO BMFF (MP4)
+                          _atom(Opus);
+                              _atom(dOps);
+                          // Sample grouping for Opus pre-roll
+                          _atom(sgpd);
+                          _atom(sbgp);
                           _atom(h263);
                           _atom(avc1);
                               _atom(avcC);

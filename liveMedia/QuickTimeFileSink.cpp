@@ -93,7 +93,7 @@ public:
 
 public:
   class SyncFrame *nextSyncFrame;
-  unsigned sfFrameNum;  
+  unsigned sfFrameNum;
 };
 
 // A 64-bit counter, used below:
@@ -127,6 +127,12 @@ public:
 			   SubsessionIOState* hintTrack);
   Boolean isHintTrack() const { return fTrackHintedByUs != NULL; }
   Boolean hasHintTrack() const { return fHintTrackForUs != NULL; }
+
+
+  // Helpers for Opus-in-Ogg over RTP payloads -> raw Opus frames for MP4
+  void processOpusOggPage(unsigned char* data, unsigned size, struct timeval presentationTime);
+  void appendToOpusBuf(unsigned char const* data, unsigned size);
+  void clearOpusBuf();
 
   UsageEnvironment& envir() const { return fOurSink.envir(); }
 
@@ -168,6 +174,28 @@ public:
       // if there's a pause at the beginning
 
   ChunkDescriptor *fHeadChunk, *fTailChunk;
+
+  // Opus-over-Ogg handling state
+  Boolean fOpusOggMode; // payloads start with 'OggS'
+  Boolean fOpusOggHeadersDone;
+  unsigned char* fOpusOggPacketBuf;
+  unsigned fOpusOggPacketSize;
+  unsigned fOpusOggPacketCap;
+  // dOps overrides from OpusHead (if present)
+  unsigned short fOpusPreSkip;
+  unsigned char fOpusChannelsOverride;
+  unsigned char fOpusMappingFamily;
+  short fOpusOutputGain;
+
+  // H.264/H.265 access unit aggregation
+  unsigned char* fH2645AUBuffer; // concatenated [len][NAL]...[len][NAL]
+  unsigned fH2645AUBufferSize;
+  unsigned fH2645AUBufferCap;
+  Boolean fHavePendingH2645AU;
+  Boolean fPendingH2645IsIDR;
+  struct timeval fPendingH2645PTS;
+  Boolean fPrevAggregatedWasIDR;
+
   unsigned fNumChunks;
   SyncFrame *fHeadSyncFrame, *fTailSyncFrame;
 
@@ -314,23 +342,28 @@ QuickTimeFileSink::QuickTimeFileSink(UsageEnvironment& env,
 }
 
 QuickTimeFileSink::~QuickTimeFileSink() {
-  completeOutputFile();
-
-  // Then, stop streaming and delete each active "SubsessionIOState":
+  // First, stop streaming on each active subsession to prevent any further callbacks
   MediaSubsessionIterator iter(fInputSession);
   MediaSubsession* subsession;
   while ((subsession = iter.next()) != NULL) {
     if (subsession->readSource() != NULL) subsession->readSource()->stopGettingFrames();
+  }
 
-    SubsessionIOState* ioState
-      = (SubsessionIOState*)(subsession->miscPtr);
+  // Now finalize the file (write moov/etc.) while IOState structures are still valid
+  completeOutputFile();
+
+  // Then, delete each active "SubsessionIOState"
+  iter.reset();
+  while ((subsession = iter.next()) != NULL) {
+    SubsessionIOState* ioState = (SubsessionIOState*)(subsession->miscPtr);
     if (ioState == NULL) continue;
 
     delete ioState->fHintTrackForUs; // if any
     delete ioState;
+    subsession->miscPtr = NULL;
   }
 
-  // Finally, close our output file:
+  // Finally, close our output file
   CloseOutputFile(fOutFid);
 }
 
@@ -346,7 +379,7 @@ QuickTimeFileSink::createNew(UsageEnvironment& env,
 			     Boolean syncStreams,
 			     Boolean generateHintTracks,
 			     Boolean generateMP4Format) {
-  QuickTimeFileSink* newSink = 
+  QuickTimeFileSink* newSink =
     new QuickTimeFileSink(env, inputSession, outputFileName, bufferSize, movieWidth, movieHeight, movieFPS,
 			  packetLossCompensate, syncStreams, generateHintTracks, generateMP4Format);
   if (newSink == NULL || newSink->fOutFid == NULL) {
@@ -538,7 +571,7 @@ SubsessionIOState::SubsessionIOState(QuickTimeFileSink& sink,
 				     MediaSubsession& subsession)
   : fHintTrackForUs(NULL), fTrackHintedByUs(NULL),
     fOurSink(sink), fOurSubsession(subsession),
-    fLastPacketRTPSeqNum(0), fHaveBeenSynced(False), fQTTotNumSamples(0), 
+    fLastPacketRTPSeqNum(0), fHaveBeenSynced(False), fQTTotNumSamples(0),
     fHeadChunk(NULL), fTailChunk(NULL), fNumChunks(0),
     fHeadSyncFrame(NULL), fTailSyncFrame(NULL) {
   fTrackID = ++fCurrentTrackNumber;
@@ -546,6 +579,26 @@ SubsessionIOState::SubsessionIOState(QuickTimeFileSink& sink,
   fBuffer = new SubsessionBuffer(fOurSink.fBufferSize);
   fPrevBuffer = sink.fPacketLossCompensate
     ? new SubsessionBuffer(fOurSink.fBufferSize) : NULL;
+
+  // Init Opus-over-Ogg handling
+  fOpusOggMode = False;
+  fOpusOggHeadersDone = False;
+  fOpusOggPacketBuf = NULL;
+  fOpusOggPacketSize = 0;
+  fOpusOggPacketCap = 0;
+  fOpusPreSkip = 0;
+  fOpusChannelsOverride = 0;
+  fOpusMappingFamily = 0;
+  fOpusOutputGain = 0;
+
+  // Init H.264/H.265 AU aggregation
+  fH2645AUBuffer = NULL;
+  fH2645AUBufferSize = 0;
+  fH2645AUBufferCap = 0;
+  fHavePendingH2645AU = False;
+  fPendingH2645IsIDR = False;
+  fPendingH2645PTS.tv_sec = fPendingH2645PTS.tv_usec = 0;
+  fPrevAggregatedWasIDR = False;
 
   FramedSource* subsessionSource = subsession.readSource();
   fOurSourceIsActive = subsessionSource != NULL;
@@ -565,6 +618,9 @@ SubsessionIOState::~SubsessionIOState() {
     delete chunk;
     chunk = next;
   }
+  if (fOpusOggPacketBuf != NULL) { delete[] fOpusOggPacketBuf; fOpusOggPacketBuf = NULL; }
+  if (fH2645AUBuffer != NULL) { delete[] fH2645AUBuffer; fH2645AUBuffer = NULL; }
+
 
   // Delete the list of sync frames:
   SyncFrame* syncFrame = fHeadSyncFrame;
@@ -631,6 +687,14 @@ Boolean SubsessionIOState::setQTstate() {
 	unsigned frequencyFromConfig
 	  = samplingFrequencyFromAudioSpecificConfig(fOurSubsession.fmtp_config());
 	if (frequencyFromConfig != 0) fQTTimeScale = frequencyFromConfig;
+      } else if (strcmp(fOurSubsession.codecName(), "OPUS") == 0) {
+	// Opus in ISO BMFF (MP4)
+	fQTMediaDataAtomCreator = &QuickTimeFileSink::addAtom_Opus;
+	fQTAudioDataType = "Opus";
+	fQTSoundSampleVersion = 0;
+	fQTTimeScale = 48000; // Opus operates at 48 kHz
+	fQTTimeUnitsPerSample = 960; // default to 20 ms per sample (common RTP pacing)
+	fQTSamplesPerFrame = 1;
       } else {
 	envir() << noCodecWarning1 << "Audio" << noCodecWarning2
 		<< fOurSubsession.codecName() << noCodecWarning3;
@@ -807,10 +871,96 @@ void SubsessionIOState::useFrame(SubsessionBuffer& buffer) {
   struct timeval const& presentationTime = buffer.presentationTime();
   int64_t const destFileOffset = TellFile64(fOurSink.fOutFid);
   unsigned sampleNumberOfFrameStart = fQTTotNumSamples + 1;
+
+  // For Opus: infer actual channel count (mono/stereo) from the first TOC byte.
+  // RFC 6716 Section 3.1: TOC byte layout is: config (5 bits) | s (1 bit) | c (2 bits)
+  // where s=0 -> mono, s=1 -> stereo. Lock this on the first packet we see.
+  if (fQTMediaDataAtomCreator == &QuickTimeFileSink::addAtom_Opus &&
+      fOpusChannelsOverride == 0 && frameSize > 0) {
+    unsigned char toc = frameSource[0];
+    unsigned char s = (toc >> 2) & 0x01; // extract 's' bit
+    fOpusChannelsOverride = s ? 2 : 1;
+  }
+
   Boolean h264or5Hack =
     fQTMediaDataAtomCreator == &QuickTimeFileSink::addAtom_avc1 ||
     fQTMediaDataAtomCreator == &QuickTimeFileSink::addAtom_hvc1;
-    
+
+  // Opus is sent as raw RFC 7587 packets now; no Ogg de-paging required here.
+
+  // Access-unit aggregation for H.264/H.265: concatenate NAL units until RTP M-bit
+  if (h264or5Hack) {
+    // Ensure AU buffer capacity for [4-byte length] + NAL bytes
+    unsigned need = 4 + frameSize;
+    if (fH2645AUBufferSize + need > fH2645AUBufferCap) {
+      unsigned newCap = fH2645AUBufferCap == 0 ? (fOurSink.fBufferSize * 2) : fH2645AUBufferCap;
+      while (newCap < fH2645AUBufferSize + need) newCap *= 2;
+      unsigned char* nb = new unsigned char[newCap];
+      if (fH2645AUBufferSize > 0 && fH2645AUBuffer != NULL) {
+        memmove(nb, fH2645AUBuffer, fH2645AUBufferSize);
+      }
+      delete[] fH2645AUBuffer; fH2645AUBuffer = nb; fH2645AUBufferCap = newCap;
+    }
+    // Append 4-byte big-endian length then NAL payload
+    fH2645AUBuffer[fH2645AUBufferSize+0] = (unsigned char)((frameSize>>24)&0xFF);
+    fH2645AUBuffer[fH2645AUBufferSize+1] = (unsigned char)((frameSize>>16)&0xFF);
+    fH2645AUBuffer[fH2645AUBufferSize+2] = (unsigned char)((frameSize>>8)&0xFF);
+    fH2645AUBuffer[fH2645AUBufferSize+3] = (unsigned char)(frameSize&0xFF);
+    memmove(fH2645AUBuffer + fH2645AUBufferSize + 4, frameSource, frameSize);
+    fH2645AUBufferSize += need;
+    if (!fHavePendingH2645AU) {
+      fPendingH2645PTS = presentationTime;
+      fHavePendingH2645AU = True;
+      fPendingH2645IsIDR = False;
+    }
+    if (isIDRFrame(*frameSource)) fPendingH2645IsIDR = True;
+
+    // Check RTP marker to know if this AU ends here
+    Boolean endOfAU = False;
+    if (fOurSubsession.rtpSource() != NULL) {
+      endOfAU = fOurSubsession.rtpSource()->curPacketMarkerBit();
+    }
+    if (!endOfAU) {
+      // Wait for more NAL units for this AU
+      return;
+    }
+
+    // We have a complete AU in fH2645AUBuffer. Finalize previous AU (if any):
+    struct timeval const& pptPrev = fPrevFrameState.presentationTime;
+    if (pptPrev.tv_sec != 0 || pptPrev.tv_usec != 0) {
+      double duration = (fPendingH2645PTS.tv_sec - pptPrev.tv_sec)
+        + (fPendingH2645PTS.tv_usec - pptPrev.tv_usec)/1000000.0;
+      if (duration < 0.0) duration = 0.0;
+      unsigned frameDuration = (unsigned)((2*duration*fQTTimeScale+1)/2);
+      if (frameDuration == 0) frameDuration = fQTTimeUnitsPerSample * fQTSamplesPerFrame;
+      unsigned numSamples = useFrame1(fPrevFrameState.frameSize, pptPrev, frameDuration, fPrevFrameState.destFileOffset);
+      fQTTotNumSamples += numSamples;
+      sampleNumberOfFrameStart = fQTTotNumSamples + 1;
+      if (fPrevAggregatedWasIDR) {
+        SyncFrame* newSyncFrame = new SyncFrame(fQTTotNumSamples + 1);
+        if (fTailSyncFrame == NULL) fHeadSyncFrame = newSyncFrame; else fTailSyncFrame->nextSyncFrame = newSyncFrame;
+        fTailSyncFrame = newSyncFrame;
+      }
+    }
+
+    // Write current AU and remember as previous for next duration computation
+    int64_t auDest = TellFile64(fOurSink.fOutFid);
+    // Write concatenated [len][NAL]... directly
+    fwrite(fH2645AUBuffer, 1, fH2645AUBufferSize, fOurSink.fOutFid);
+
+    fPrevFrameState.frameSize = fH2645AUBufferSize;
+    fPrevFrameState.presentationTime = fPendingH2645PTS;
+    fPrevFrameState.destFileOffset = auDest;
+    fPrevAggregatedWasIDR = fPendingH2645IsIDR;
+
+    // Reset AU buffer
+    fH2645AUBufferSize = 0;
+    fHavePendingH2645AU = False;
+    fPendingH2645IsIDR = False;
+
+    // Done handling this frame
+    return;
+  }
 
   // If we're not syncing streams, or this subsession is not video, then
   // just give this frame a fixed duration:
@@ -818,7 +968,6 @@ void SubsessionIOState::useFrame(SubsessionBuffer& buffer) {
       || fQTcomponentSubtype != fourChar('v','i','d','e')) {
     unsigned const frameDuration = fQTTimeUnitsPerSample*fQTSamplesPerFrame;
     unsigned frameSizeToUse = frameSize;
-    if (h264or5Hack) frameSizeToUse += 4; // H.264/5 gets the frame size prefix
 
     fQTTotNumSamples += useFrame1(frameSizeToUse, presentationTime, frameDuration, destFileOffset);
   } else {
@@ -833,8 +982,11 @@ void SubsessionIOState::useFrame(SubsessionBuffer& buffer) {
       if (duration < 0.0) duration = 0.0;
       unsigned frameDuration
 	= (unsigned)((2*duration*fQTTimeScale+1)/2); // round
+      // Ensure non-zero duration for synced video streams (e.g., identical PTS):
+      if (frameDuration == 0) {
+	frameDuration = fQTTimeUnitsPerSample * fQTSamplesPerFrame;
+      }
       unsigned frameSizeToUse = fPrevFrameState.frameSize;
-      if (h264or5Hack) frameSizeToUse += 4; // H.264/5 gets the frame size prefix
 
       unsigned numSamples
 	= useFrame1(frameSizeToUse, ppt, frameDuration, fPrevFrameState.destFileOffset);
@@ -842,23 +994,11 @@ void SubsessionIOState::useFrame(SubsessionBuffer& buffer) {
       sampleNumberOfFrameStart = fQTTotNumSamples + 1;
     }
 
-    if (h264or5Hack && isIDRFrame(*frameSource)) {
-      SyncFrame* newSyncFrame = new SyncFrame(fQTTotNumSamples + 1);
-      if (fTailSyncFrame == NULL) {
-        fHeadSyncFrame = newSyncFrame;
-      } else {
-        fTailSyncFrame->nextSyncFrame = newSyncFrame;
-      }
-      fTailSyncFrame = newSyncFrame;
-    }
-
     // Remember the current frame for next time:
     fPrevFrameState.frameSize = frameSize;
     fPrevFrameState.presentationTime = presentationTime;
     fPrevFrameState.destFileOffset = destFileOffset;
   }
-
-  if (h264or5Hack) fOurSink.addWord(frameSize);
 
   // Write the data into the file:
   fwrite(frameSource, 1, frameSize, fOurSink.fOutFid);
@@ -905,6 +1045,11 @@ void SubsessionIOState::useFrameForHinting(unsigned frameSize,
     if (msDuration > fHINF.dmax) fHINF.dmax = msDuration;
     unsigned hintSampleDuration
       = (unsigned)((2*duration*fQTTimeScale+1)/2); // round
+    // Ensure non-zero hint sample duration
+    if (hintSampleDuration == 0) {
+      hintSampleDuration = fTrackHintedByUs != NULL ? fTrackHintedByUs->fQTTimeUnitsPerSample
+                                                   : fQTTimeUnitsPerSample;
+    }
     if (hackm4a) {
       // Because multiple AAC frames can appear in a RTP packet, the presentation
       // times of the second and subsequent frames will not be accurate.
@@ -1106,6 +1251,82 @@ unsigned SubsessionIOState::useFrame1(unsigned sourceDataSize,
   return numSamples;
 }
 
+void SubsessionIOState::appendToOpusBuf(unsigned char const* data, unsigned size) {
+  if (size == 0) return;
+  if (fOpusOggPacketSize + size > fOpusOggPacketCap) {
+    unsigned newCap = fOpusOggPacketCap == 0 ? (size * 2) : fOpusOggPacketCap;
+    while (newCap < fOpusOggPacketSize + size) newCap *= 2;
+    unsigned char* newBuf = new unsigned char[newCap];
+    if (fOpusOggPacketSize > 0 && fOpusOggPacketBuf != NULL) {
+      memmove(newBuf, fOpusOggPacketBuf, fOpusOggPacketSize);
+    }
+    delete[] fOpusOggPacketBuf;
+    fOpusOggPacketBuf = newBuf; fOpusOggPacketCap = newCap;
+  }
+  memmove(fOpusOggPacketBuf + fOpusOggPacketSize, data, size);
+  fOpusOggPacketSize += size;
+}
+
+void SubsessionIOState::clearOpusBuf() {
+  fOpusOggPacketSize = 0;
+}
+
+void SubsessionIOState::processOpusOggPage(unsigned char* data, unsigned size, struct timeval presentationTime) {
+  // If this is not an Ogg page, pass the buffer through as a single raw Opus packet
+  if (!(size >= 4 && data[0] == 'O' && data[1] == 'g' && data[2] == 'g' && data[3] == 'S')) {
+    int64_t const off = TellFile64(fOurSink.fOutFid);
+    unsigned const frameDuration = fQTTimeUnitsPerSample * fQTSamplesPerFrame;
+    fQTTotNumSamples += useFrame1(size, presentationTime, frameDuration, off);
+    fwrite(data, 1, size, fOurSink.fOutFid);
+    return;
+  }
+
+  if (size < 27) return; // invalid
+  unsigned char pageSegments = data[26];
+  if (27 + pageSegments > size) return; // invalid
+  unsigned payloadStart = 27 + pageSegments;
+  unsigned payloadPos = payloadStart;
+  for (unsigned i = 0; i < pageSegments; ++i) {
+    unsigned segLen = data[27 + i];
+    if (payloadPos + segLen > size) return; // invalid
+    appendToOpusBuf(data + payloadPos, segLen);
+    payloadPos += segLen;
+    if (segLen < 255) {
+      // End of packet
+      if (fOpusOggPacketSize >= 8 && memcmp(fOpusOggPacketBuf, "OpusHead", 8) == 0) {
+        if (!fOpusOggHeadersDone) {
+          if (fOpusOggPacketSize >= 19) {
+            // Parse minimal fields
+            fOpusChannelsOverride = fOpusOggPacketBuf[9];
+            fOpusPreSkip = (unsigned short)(fOpusOggPacketBuf[10] | (fOpusOggPacketBuf[11] << 8));
+            // Input sample rate (LE 32) at 12..15 is not needed (fixed 48000 in dOps)
+            fOpusOutputGain = (short)(fOpusOggPacketBuf[16] | (fOpusOggPacketBuf[17] << 8));
+            fOpusMappingFamily = fOpusOggPacketBuf[18];
+          }
+          // We consider headers done after OpusHead; OpusTags will be ignored
+          fOpusOggHeadersDone = True;
+        }
+        clearOpusBuf();
+        continue;
+      }
+      if (fOpusOggPacketSize >= 8 && memcmp(fOpusOggPacketBuf, "OpusTags", 8) == 0) {
+        clearOpusBuf();
+        continue;
+      }
+      // Treat as an Opus audio packet
+      unsigned const packetLen = fOpusOggPacketSize;
+      if (packetLen > 0) {
+        int64_t const off = TellFile64(fOurSink.fOutFid);
+        unsigned const frameDuration = fQTTimeUnitsPerSample * fQTSamplesPerFrame;
+        fQTTotNumSamples += useFrame1(packetLen, presentationTime, frameDuration, off);
+        fwrite(fOpusOggPacketBuf, 1, packetLen, fOurSink.fOutFid);
+      }
+      clearOpusBuf();
+    }
+  }
+}
+
+
 void SubsessionIOState::onSourceClosure() {
   fOurSourceIsActive = False;
   fOurSink.onSourceClosure1();
@@ -1157,7 +1378,7 @@ void SubsessionIOState::setHintTrack(SubsessionIOState* hintedTrack,
 
 SyncFrame::SyncFrame(unsigned frameNum)
   : nextSyncFrame(NULL), sfFrameNum(frameNum) {
-}  
+}
 
 void Count64::operator+=(unsigned arg) {
   unsigned newLo = lo + arg;
@@ -1330,6 +1551,7 @@ addAtom(ftyp);
   size += addWord(0x00000000);
   size += add4ByteString("mp42");
   size += add4ByteString("isom");
+  size += add4ByteString("iso2");
 addAtomEnd;
 
 addAtom(moov);
@@ -1669,6 +1891,13 @@ addAtom(stbl);
   size += addAtom_stsc();
   size += addAtom_stsz();
   size += addAtom_co64();
+  // For Opus audio, signal pre-roll using sample grouping ('roll')
+  if (fGenerateMP4Format &&
+      fCurrentIOState->fQTMediaDataAtomCreator == &QuickTimeFileSink::addAtom_Opus) {
+    // Temporarily disable 'sgpd'/'sbgp' for Opus until fully verified
+    // size += addAtom_sgpd();
+    // size += addAtom_sbgp();
+  }
 addAtomEnd;
 
 addAtom(stsd);
@@ -1834,7 +2063,7 @@ addAtom(esds);
   }
   delete[] config;
 
-  
+
   // SLConfigDescriptor:
   if (strcmp(subsession.mediumName(), "audio") == 0) { // MPEG-4 audio
     size += addWord(0x06808080); // SLConfigDescrTag + length coding
@@ -1843,6 +2072,77 @@ addAtom(esds);
     size += addHalfWord(0x0601); // SLConfigDescrTag + length(1)
     size += addByte(0x02); // ???
   }
+addAtomEnd;
+
+
+
+// ===== Opus in ISO BMFF (MP4) support =====
+addAtom(Opus);
+  // Opus Sample Entry (AudioSampleEntry with 'dOps')
+  // Write the AudioSampleEntry fields directly (do NOT call addAtom_soundMediaGeneral(),
+  // because this function already wrote the 'Opus' atom header above).
+  // General sample description fields:
+  size += addWord(0x00000000); // Reserved
+  size += addWord(0x00000001); // Reserved + Data reference index
+  // Sound sample description fields (version 0):
+  size += addWord(0x00000000); // Version + Revision level
+  size += addWord(0x00000000); // Vendor
+  unsigned short opusChannels = (unsigned short)(fCurrentIOState->fOurSubsession.numChannels());
+  if (opusChannels == 0) opusChannels = 2;
+  size += addHalfWord(opusChannels); // Number of channels
+  size += addHalfWord(0x0010); // Sample size (bits)
+  size += addHalfWord(0xFFFE); // Compression ID (-2: compressed)
+  size += addHalfWord(0x0000); // Packet size
+  unsigned const opusSampleRateFixed = 48000 << 16; // Opus decoder rate is 48 kHz
+  size += addWord(opusSampleRateFixed); // Sample rate
+  // OpusSpecificBox
+  size += addAtom_dOps();
+addAtomEnd;
+
+addAtom(dOps);
+  // Opus Specific Box per "Opus in ISOBMFF" (fields are big-endian per spec)
+  size += addByte(0x00); // Version
+  unsigned outputCh = fCurrentIOState->fOpusChannelsOverride;
+  if (outputCh == 0) outputCh = fCurrentIOState->fOurSubsession.numChannels();
+  if (outputCh == 0) outputCh = 2; // default to stereo if unknown
+  size += addByte((unsigned char)outputCh); // OutputChannelCount
+  // PreSkip (BE 16)
+  unsigned short ps = fCurrentIOState->fOpusPreSkip;
+  size += addByte((unsigned char)((ps >> 8) & 0xFF));
+  size += addByte((unsigned char)(ps & 0xFF));
+  // InputSampleRate (BE 32). Opus decoder input rate is 48000 Hz
+  unsigned isr = 48000; // per RFC 6716; do not use variable rate here
+  size += addByte((unsigned char)((isr >> 24) & 0xFF));
+  size += addByte((unsigned char)((isr >> 16) & 0xFF));
+  size += addByte((unsigned char)((isr >> 8) & 0xFF));
+  size += addByte((unsigned char)(isr & 0xFF));
+  // OutputGain (BE 16, Q8.8 fixed). 0 = no gain
+  short og = fCurrentIOState->fOpusOutputGain;
+  size += addByte((unsigned char)((og >> 8) & 0xFF));
+  size += addByte((unsigned char)(og & 0xFF));
+  unsigned char channelMappingFamily = fCurrentIOState->fOpusMappingFamily != 0
+                                       ? fCurrentIOState->fOpusMappingFamily
+                                       : ((outputCh <= 2) ? 0 : 1);
+  size += addByte(channelMappingFamily); // ChannelMappingFamily
+  // For ChannelMappingFamily == 0, no ChannelMappingTable follows
+addAtomEnd;
+
+addAtom(sgpd);
+  // Sample Group Description Box: 'roll' with AudioRollRecoveryEntry
+  size += addWord(0x00000001); // version=1, flags=0
+  size += add4ByteString("roll"); // grouping_type
+  size += addWord(2); // default_length = 2 bytes per entry
+  size += addWord(1); // entry_count = 1
+  size += addHalfWord(0xFFFC); // roll_distance = -4 samples (80ms with 20ms samples)
+addAtomEnd;
+
+addAtom(sbgp);
+  // Sample to Group Box: map all samples to the 'roll' group entry index 1
+  size += addWord(0x00000000); // version=0, flags=0
+  size += add4ByteString("roll"); // grouping_type
+  size += addWord(1); // entry_count = 1
+  size += addWord(fCurrentIOState->fQTTotNumSamples); // sample_count (all samples)
+  size += addWord(1); // group_description_index = 1
 addAtomEnd;
 
 addAtom(srcq);
@@ -2158,7 +2458,7 @@ addAtom(stss); // Sync-Sample
 
     while (currentSyncFrame != NULL) {
       if (currentSyncFrame->sfFrameNum >= totNumFrames) break; // sanity check
-      
+
       ++numEntries;
       size += addWord(currentSyncFrame->sfFrameNum);
       currentSyncFrame = currentSyncFrame->nextSyncFrame;
@@ -2172,7 +2472,7 @@ addAtom(stss); // Sync-Sample
       numSamplesSoFar += numSamples;
       chunk = chunk->fNextChunk;
     }
-  
+
     // Then, write out the sample numbers that we deem correspond to 'sync samples':
     unsigned i;
     for (i = 0; i < numSamplesSoFar; i += 12) {
@@ -2181,7 +2481,7 @@ addAtom(stss); // Sync-Sample
       size += addWord(i+1);
       ++numEntries;
     }
-  
+
     // Then, write out the last entry (if we haven't already done so):
     if (i != (numSamplesSoFar - 1)) {
       size += addWord(numSamplesSoFar);
