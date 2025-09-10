@@ -188,8 +188,10 @@ void BasicTaskScheduler::SingleStep(unsigned maxDelayTime) {
       if (mask == 0) mask = EVENT_TRIGGER_ID_HIGH_BIT;
 
 #ifndef NO_STD_LIB
-      if (fTriggersAwaitingHandling[i].test()) {
-	fTriggersAwaitingHandling[i].clear();
+      // atomic_flag::test() requires C++20. Emulate by using test_and_set() then clear().
+      bool wasSet = fTriggersAwaitingHandling[i].test_and_set();
+      fTriggersAwaitingHandling[i].clear();
+      if (wasSet) {
 #else
       if (fTriggersAwaitingHandling[i]) {
 	fTriggersAwaitingHandling[i] = False;
