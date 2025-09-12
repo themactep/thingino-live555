@@ -63,7 +63,7 @@ Boolean parseMikeyHDR(u_int8_t const*& ptr, u_int8_t const* endPtr, u_int8_t& ne
     u_int8_t policy_no = getByte(ptr);
     u_int32_t ssrc = get4Bytes(ptr);
     u_int32_t roc = get4Bytes(ptr);
-    
+
     fprintf(stderr, "\tPolicy_no_%d: %d;\tSSRC_%d: 0x%08x; ROC_%d: 0x%08x\n",
 	    i, policy_no,
 	    i, ssrc,
@@ -87,19 +87,19 @@ static Boolean parseKeyDataSubPayload(u_int8_t const*& ptr, u_int8_t const* endP
 	  Type == 0 ? "TGK" : Type == 1 ? "TGK+SALT" : Type == 2 ? "TEK" : Type == 3 ? "TEK+SALT" : "unknown");
   if (Type > 3) return False;
   Boolean hasSalt = Type == 1 || Type == 3;
-  
+
   fprintf(stderr, "\t\tKey Validity: %d (%s)\n", KV,
 	  KV == 0 ? "NULL" : KV == 1 ? "SPI/MKI" : KV == 2 ? "Interval" : "unknown");
   Boolean hasKV = KV != 0;
 
   u_int16_t keyDataLen = get2Bytes(ptr);
   fprintf(stderr, "\t\tKey data len: %d\n", keyDataLen);
-  
+
   testSize(keyDataLen);
   fprintf(stderr, "\t\tKey data: ");
   for (unsigned i = 0; i < keyDataLen; ++i) fprintf(stderr, ":%02x", getByte(ptr));
   fprintf(stderr, "\n");
-  
+
   if (hasSalt) {
     testSize(2);
     u_int16_t saltLen = get2Bytes(ptr);
@@ -142,7 +142,7 @@ static Boolean parseKeyDataSubPayload(u_int8_t const*& ptr, u_int8_t const* endP
       fprintf(stderr, "\n");
     }
   }
-    
+
   return True;
 }
 
@@ -161,7 +161,7 @@ Boolean parseMikeyKEMAC(u_int8_t const*& ptr, u_int8_t const* endPtr, u_int8_t& 
 
   testSize(encrDataLen + 1/*allow for "Mac alg"*/);
   u_int8_t const* endOfKeyData = ptr + encrDataLen;
-  
+
   // Allow for multiple key data sub-payloads
   while (ptr < endOfKeyData) {
     if (!parseKeyDataSubPayload(ptr, endOfKeyData, nextPayloadType)) return False;
@@ -399,7 +399,7 @@ int main(int argc, char** argv) {
     // Begin by parsing an initial "HDR":
     fprintf(stderr, "HDR:\n");
     if (!parseMikeyHDR(ptr, endPtr, nextPayloadType)) break;
-  
+
     // Then parse each successive payload:
     while (nextPayloadType != 0 /* Last payload */) {
       fprintf(stderr, "%s:\n", payloadTypeName[nextPayloadType]);
@@ -408,7 +408,7 @@ int main(int argc, char** argv) {
   } while (0);
 
   if (ptr < endPtr) {
-    fprintf(stderr, "+%ld bytes of unparsed data: ", endPtr-ptr);
+    fprintf(stderr, "+%td bytes of unparsed data: ", endPtr-ptr);
     while (ptr < endPtr) fprintf(stderr, ":%02x", *ptr++);
     fprintf(stderr, "\n");
   }
